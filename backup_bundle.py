@@ -267,7 +267,7 @@ def simple_lock_file(lock_file: Path) -> Generator[None, None, None]:
     :raises SimpleLockFileNotCreatedError: When creating the lock failed.
     """
     try:
-        with lock_file.open(mode="x") as f:
+        with lock_file.open(mode="x", encoding="utf-8") as f:
             try:
                 yield
             finally:
@@ -377,8 +377,8 @@ class Backup:
             call_git(["clone", "--no-hardlinks", *mirrored, remote, str(repo)], cwd=Path())
 
     def perform_backup(
-        self, bundle: Path, stored_bundle: Path, metadata_file: Path | None, *, timestamped: bool
-    ) -> None:
+        self, bundle: Path, stored_bundle: Path, metadata_file: Path | None, *, timestamped: bool, skip_unchanged: bool
+    ) -> bool:
         """
         Create a new backup bundle with the settings in this Backup object.
 
@@ -386,7 +386,11 @@ class Backup:
         :param stored_bundle: The bundle file that is used as a reference for the previous backup.
         :param metadata_file: If set, a file with metadata about the (previous) backup. This enabled the backup of tags.
         :param timestamped: If set, the filename `bundle` has a timestamp added.
+        :param skip_unchanged: If set, no bundle file is written if it does not contain new commits or updated
+                               references compared to `stored_bundle`.
+        :returns: Whether a backup bundle was written.
         """
+
         # If we're working in mirror mode, trigger a remote update, first
         if self.mirror:
             call_git(["remote", "update", "--prune"], cwd=self.repo)
@@ -397,9 +401,16 @@ class Backup:
             bundle = bundle.parent / f"{bundle.stem}.{timestamp}Z{bundle.suffix}"
 
         # Create the incremental backup
-        metadata = self._create_incremental_bundle(
-            bundle.absolute(), stored_bundle.absolute(), metadata_file.absolute() if metadata_file else None
+        metadata, bundle_written = self._create_incremental_bundle(
+            bundle.absolute(),
+            stored_bundle.absolute(),
+            metadata_file.absolute() if metadata_file else None,
+            skip_unchanged=skip_unchanged,
         )
+
+        # No need to continue if no bundle file was written
+        if not bundle_written:
+            return False
 
         # Save the bundle and its metadata as reference points for the next incremental backup.
         if bundle.resolve() != stored_bundle.resolve():
@@ -408,7 +419,11 @@ class Backup:
             metadata_file.write_text(json.dumps(asdict(metadata)))
             log.info("Written backup metadata to %s", metadata_file)
 
-    def _create_incremental_bundle(self, bundle: Path, stored_bundle: Path, metadata_file: Path | None) -> Metadata:
+        return True
+
+    def _create_incremental_bundle(
+        self, bundle: Path, stored_bundle: Path, metadata_file: Path | None, *, skip_unchanged: bool
+    ) -> tuple[Metadata, bool]:
         """
         Create an incremental backup bundle from a repository.
 
@@ -419,7 +434,9 @@ class Backup:
                        interpreted relative to the repository.
         :param stored_bundle: The bundle file that is used as a reference for the previous backup.
         :param metadata_file: If set, a file with metadata about the (previous) backup. This enabled the backup of tags.
-        :return: A Metadata that accompanies the written bundle file.
+        :param skip_unchanged: If set, no bundle file is written if it does not contain new commits or updated
+                               references compared to `stored_bundle`.
+        :return: A Metadata that accompanies the written bundle file, and whether the bundle file has been written.
         """
         # Read the metadata file
         metadata: Metadata | None
@@ -451,14 +468,16 @@ class Backup:
         if metadata:
             refs_to_include = [ref for ref in refs_to_include if ref.ref not in metadata.known_tag_refs]
 
-        # Find all the commits pointed to be the references in the previous backup (by querying the previous bundle
+        # Find all the commits pointed to by the references in the previous backup (by querying the previous bundle
         # directly): they should all be excluded from the new bundle. This makes it an incremental backup.
         previous_backup_ref_commits: list[str] = []
+        previous_backup_references: list[GitRef] = []
         if stored_bundle.exists():
-            previous_backup_ref_commits = [
-                GitRef.from_show_ref(ref_line).hash
-                for ref_line in call_git(["ls-remote", "--heads", "--tags", str(stored_bundle)], cwd=Path())
+            previous_backup_references = [
+                GitRef.from_show_ref(ref_line)
+                for ref_line in call_git(["ls-remote", "--heads", *include_tags, str(stored_bundle)], cwd=Path())
             ]
+            previous_backup_ref_commits = [ref.hash for ref in previous_backup_references]
 
         # Calculate the list of all new commits in this repository, compared to the previous bundle. These commits will
         # all be included in the new bundle.
@@ -468,13 +487,25 @@ class Backup:
                 cwd=self.repo,
             )
         )
+
+        # Not having new commits would make the bundle a bit of an odd case. In particular it will lack ordering among
+        # other incremental bundles, which may cause unwanted effects if it's still used for restoring references.
         if not new_commits:
-            log.warning(
-                "Bundle %s will not contain any new commits. Restoring this bundle will be a no-op and will "
-                "not update any references. To force restoring the bundle anyway, pass the filename of the "
-                "exact bundle (as opposed to the directory containing it) and --force when restoring.",
-                bundle,
-            )
+            if skip_unchanged:
+                # There are no new commits. If none of the references have been updated, either, then we're done since
+                # it has been requested to only write a bundle file if something has changed.
+                if not set(previous_backup_references) ^ set(refs_to_include):
+                    log.info("No changes detected. Not creating a new bundle, as requested.")
+                    return metadata or Metadata(version=Metadata.CURRENT_VERSION), False
+            else:
+                # Without new commits, normal operation will still write a new bundle, but the user will need to know
+                # how to correctly import it (if they want to).
+                log.warning(
+                    "Bundle %s will not contain any new commits. Restoring this bundle will be a no-op and will "
+                    "not update any references. To force restoring the bundle anyway, pass the filename of the "
+                    "exact bundle (as opposed to the directory containing it) and --force when restoring.",
+                    bundle,
+                )
 
         # Next to the new commits, the commit that each reference in the repository points to must be included, as well.
         # This is required to allow those references to be included in the new bundle.
@@ -516,13 +547,13 @@ class Backup:
             cwd=self.repo,
         )
 
-        # Return the metadata, even we weren't provided with one to begin with.
+        # Return the metadata, even if we weren't provided with one to begin with.
         if not metadata:
             metadata = Metadata(version=Metadata.CURRENT_VERSION)
 
         new_tag_refs = {ref.ref for ref in refs_to_include if ref.ref.startswith("refs/tags/")}
         metadata.known_tag_refs = list(set(metadata.known_tag_refs) | new_tag_refs)
-        return metadata
+        return metadata, True
 
 
 def are_available(repo: Path, commits: list[GitRef]) -> bool:
@@ -871,7 +902,26 @@ class Restoration:
 
         return True
 
-    def restore_bundles(self, bundle: Path) -> int:
+    @staticmethod
+    def _list_bundles(bundle: Path) -> list[Path]:
+        """
+        List the bundle files found.
+
+        :param bundle: The path to list bundle files for.
+        :returns: A list with just `bundle` if that is a file, otherwise all files with the `.bundle` extension in that
+                  directory. The list will be sorted.
+        """
+        if bundle.is_dir():
+            bundles = [f for f in bundle.iterdir() if f.is_file() and f.suffix == ".bundle"]
+        else:
+            bundles = [bundle]
+
+        # Sort the bundles by filename for optimization
+        bundles.sort()
+
+        return bundles
+
+    def restore_bundles(self, bundle: Path, *, strict_order: bool) -> int:
         """
         Restore data from one or more bundles.
 
@@ -880,18 +930,15 @@ class Restoration:
         :param bundle: The bundle to restore from. If a directory is passed, any files in it with the `.bundle`
                        extension will be attempted (repeatedly, until none of them can restore anymore). Directory
                        handling is optimal if the bundle files can be restored in alphabetical order.
+        :param strict_order: If set, bundle files in a directory will be processed strictly in order of their filenames,
+                             with no cycling over the bundles to attempt to restore other bundles when one fails to be
+                             restored.
         :return: The total number of bundles found. If bundle is a file this is 1, otherwise it's the number of bundle
                  files found in the directory bundle points to.
         """
         # Figure out which bundle files to handle
-        if bundle.is_dir():
-            bundles = [f for f in bundle.iterdir() if f.is_file() and f.suffix == ".bundle"]
-        else:
-            bundles = [bundle]
+        bundles = Restoration._list_bundles(bundle)
         log.info("Found %d bundles to restore.", len(bundles))
-
-        # Sort the bundles by filename for optimization
-        bundles.sort()
 
         # Find the references included in each bundle
         references = {bundle: list_references_in_repo(bundle) for bundle in bundles}
@@ -912,8 +959,13 @@ class Restoration:
                 # bundle B being restored can actually mean that A has been restored when this is attempted again (A was
                 # a strict subset of B, apparently).
                 #
-                # A single file can still be force-restored. This allows recovering from (some) errors.
-                if not (self.force and bundle.is_file()) and are_available(self.repo, references[current_bundle]):
+                # A single file can be force-restored. This allows recovering from (some) errors.
+                #
+                # Files in a directory can also be force-restored when they're being processed in strict order. This
+                # facilitates even closer mirroring a repository by continuously providing updates, even if those only
+                # contain reference updates.
+                apply_force = self.force and (strict_order or bundle.is_file())
+                if not apply_force and are_available(self.repo, references[current_bundle]):
                     log.warning("Bundle %s has already been restored", current_bundle)
                     restore_more_bundles |= self._mark_bundle_restored(current_bundle, was_already_restored=True)
                     continue
@@ -929,6 +981,9 @@ class Restoration:
                     )
                     # This issue remains no matter how many other bundles we restore
                     self.skip_bundles.add(current_bundle)
+                    # Continue with the next bundle file, unless they were to be processed in strict order.
+                    if strict_order:
+                        break
                     continue
 
                 first_detach_head = self._need_detach_head_first(references[current_bundle])
@@ -944,9 +999,17 @@ class Restoration:
                     detach_head=first_detach_head,
                     reset_current_branch_to=first_reset_current_branch_to,
                 ):
+                    # Continue with the next bundle file, unless they were to be processed in strict order.
+                    if strict_order:
+                        break
                     continue
 
                 restore_more_bundles |= self._mark_bundle_restored(current_bundle)
+
+            # When bundle files are to be processed in strict order, never attempt to restore more bundles in another
+            # loop over the directory.
+            if strict_order:
+                restore_more_bundles = False
         return len(bundles)
 
 
@@ -995,8 +1058,8 @@ def _add_common_arguments(parser: argparse.ArgumentParser) -> None:
         action="store",
         type=str,
         help=(
-            "Use this JSON string as a logging configuration dictionary. See python's GitCallFailedError "
-            "logging.config.dictConfig for the contents of the dictionary."
+            "Use this JSON string as a logging configuration dictionary. See python's logging.config.dictConfig for "
+            "the contents of the dictionary."
         ),
     )
 
@@ -1096,6 +1159,15 @@ def main(argv: list[str]) -> None:
         action="store_true",
         help="Add a timestamp (with second resolution) to the name of the created bundle file.",
     )
+    backup_parser.add_argument(
+        "-s",
+        "--skip-unchanged",
+        action="store_true",
+        help=(
+            "Do not create a bundle if it would contain no (incremental) changes. A bundle with changes to "
+            "references but no new commits will still be created, and no warning will be emitted in that case."
+        ),
+    )
 
     restore_parser.add_argument(
         "repo", action="store", type=Path, default=Path(), help="The repository to restore data to."
@@ -1118,6 +1190,17 @@ def main(argv: list[str]) -> None:
             "Force updates to all branches, even if the update is not a fast-forward or your worktree is not clean. If "
             "a file is provided as the bundle to restore (as opposed to a directory) then all references will be "
             "updated to reflect the contents of that bundle, even if the bundle does not contain any new commits."
+        ),
+    )
+    restore_parser.add_argument(
+        "-s",
+        "--strict-order",
+        action="store_true",
+        help=(
+            "If a directory is provided with bundles to restore, then the bundles in that directory are processsed "
+            "strictly in order of their filenames. If a bundle fails to be restored, then no attempts will be made to "
+            "restore other bundles from the directory. If both --strict-order and --force are used, then --force "
+            "applies to each bundle in the directory as if the bundle file was being provided directly."
         ),
     )
     restore_parser.add_argument(
@@ -1148,7 +1231,7 @@ def main(argv: list[str]) -> None:
 
     action = Actions(cast(str, args.action))
 
-    log.debug("%s called with arguments: %s", __name__, str(argv))
+    log.debug("%s called with arguments: %s", __name__, argv)
 
     if action == Actions.Create:
         bundle = cast(Path, args.bundle)
@@ -1157,13 +1240,14 @@ def main(argv: list[str]) -> None:
             cast(str | None, args.remote),
             mirror=bool(args.mirror),
         )
-        backup.perform_backup(
+        if backup.perform_backup(
             bundle,
             cast(Path | None, args.previous_bundle_location) or bundle,
             cast(Path | None, args.metadata),
             timestamped=bool(args.timestamp),
-        )
-        log.info("Created backup bundle %s", bundle)
+            skip_unchanged=bool(args.skip_unchanged),
+        ):
+            log.info("Created backup bundle %s", bundle)
     elif action == Actions.Restore:
         lock_file = cast(Path | None, args.lock_file)
         try:
@@ -1176,7 +1260,7 @@ def main(argv: list[str]) -> None:
                     prune=bool(args.prune),
                     delete_files=bool(args.delete_files),
                 )
-                bundle_count = restoration.restore_bundles(bundle)
+                bundle_count = restoration.restore_bundles(bundle, strict_order=bool(args.strict_order))
 
                 if restoration.restored_bundle_count == 0:
                     log.error("Restoring bundling to repository failed: no bundles were restored")

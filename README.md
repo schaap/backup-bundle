@@ -142,7 +142,7 @@ On the office network create backups based on a local mirror:
     mkdir -p /path/to/local_mirror_directory/updates  # First-time setup, only
     cd /path/to/local_mirror_directory
     python3 backup_bundle.py create repo updates/bundle.bundle --remote https://github.com/awesome_project.git \
-        --mirror --metadata metadata.json --previous-bundle-location previous.bundle --timestamped
+        --mirror --metadata metadata.json --previous-bundle-location previous.bundle --timestamp --skip-unchanged
 
 Copy the contents of the directory `/path/to/local_mirror_directory/updates/` to the internal network (make sure the
 bundles have not been corrupted!). There you can restore them:
@@ -153,13 +153,21 @@ bundles have not been corrupted!). There you can restore them:
 This will create a bare repository that mirrors the upstream repository. It can be used (read-only!) as if it were the
 upstream repository itself.
 
-Note that the backup step above will create a new bundle file every time. The restore command restores any of those
-bundles it can, in the correct order. This is based on the fact that every consecutive bundle contains at least one new
-commit - any form of timestamps is not used for this. If a bundle contains no new commits it's effectively treated as if
-it was already restored and is just deleted.
+Note that the backup step above will create a new bundle file every time there are changes. The restore command restores
+any of those bundles it can, in the correct order. This is based on the fact that every consecutive bundle contains at
+least one new commit - any form of timestamps is not used for this. If a bundle contains no new commits it's effectively
+treated as if it was already restored and is just deleted.
 
 This workflow allows decoupling the timing of creating backup bundles and restoring them. It also takes unreliable
 transport into account in that missing files are not a problem, but they should not be corrupted.
+
+If you have a more reliable transport mechanism, you can consider adding `--strict-order` on the internal network: this
+will also restore any bundles that only contain reference updates (e.g. a new tag) without any new commits. These are
+normally skipped because their ordering can't be determined automatically. This introduces a risk (very small, given the
+rather odd upstream interactions that could trigger the situation) that when one or more bundles fail to be transported
+correctly and a later bundle with only reference updates does transport correctly, that the copy on the internal network
+ends up with its references in an odd state. This situation will always resolve itself again when a newer incremental
+bundle is restored which contains at least one new commit.
 
 ## Exit Code
 
@@ -234,7 +242,7 @@ Although `--force` sounds like a solution to all your problems, it should be use
 `backup_bundle.py` and git try hard not to touch your work, using `--force` will make them both a lot more aggressive.
 You're basically saying: "I don't care what you have to do, make it work." And *they will*.
 
-In a bare target  repository using `--force` is not really an issue. You're presumably not actively working there,
+In a bare target repository using `--force` is not really an issue. You're presumably not actively working there,
 anyway, so all you're doing is making sure changes are made so the target repository continues to closely mirror the
 source repository.
 
@@ -251,8 +259,8 @@ is clean. Chances are all you'll need to do then is rebase or merge your own wor
 
 The two general forms of calling `backup_bundle.py` are:
 
-1. `python3 backup_bundle.py create REPO BUNDLE [--remote REMOTE] [--mirror] [--previous-bundle-location PREVIOUS] [--metadata METADATA]`
-2. `python3 backup_bundle.py restore REPO BUNDLE [--bare] [--force] [--prune] [--delete-files] [--lock-file LOCK_FILE]`
+1. `python3 backup_bundle.py create REPO BUNDLE [--remote REMOTE] [--mirror] [--skip-unchanged] [--previous-bundle-location PREVIOUS] [--metadata METADATA]`
+2. `python3 backup_bundle.py restore REPO BUNDLE [--bare] [--strict-order] [--force] [--prune] [--delete-files] [--lock-file LOCK_FILE]`
 
 Additionally both forms accept logging configuration:
 
@@ -270,7 +278,7 @@ If `REPO` does not exist yet or is an empty directory, then a clone of `REMOTE` 
 
 If `--mirror` is also given the clone will be made with `git clone`'s `--mirror`, resulting in a bare repository.
 Otherwise a normal clone is created, but without a checkout. If a worktree is desired, you can run, for example,
-`git checkout main` to create a checkout (of `main`, in this case) later on.
+`git switch main` to create a checkout (of `main`, in this case) later on.
 
 The option has no effect if `REPO` is already an existing git repository.
 
@@ -282,13 +290,22 @@ with `git clone`'s `--mirror`, making it a bare repository that extremely closel
 When creating a backup bundle with `--mirror`, a `git remote update` will be performed first to pull in the latests
 changes from upstream.
 
+### `-s`, `--skip-unchanged`
+
+Normally `backup-bundle.py` will always create a new backup bundle, even if there were no actual changes. With
+`--skip-unchanged` no file will be written if there are no changes at all. Additionally, no warning will be given if
+the new backup bundle would only contain reference updates but no new commits.
+
+`--skip-unchanged` is geared towards automated mirroring and pairs well with `--force` and `--strict-order`, provided
+that the (automated) transport is sufficiently reliable.
+
 ### `-p`, `--previous-bundle-location`
 
 Incremental backups are created by using the backup bundle from the previous (incremental) backup as a reference point.
 By default this reference is just `BUNDLE` itself, but it can be explicitly set to a different file.
 
-This option is particularly useful when using `--timestamped` to create (a directory of) timestamped bundle files.
-Although `--timestamped` will work without `--previous-bundle-location`, `BUNDLE` would then still be written and in the
+This option is particularly useful when using `--timestamp` to create (a directory of) timestamped bundle files.
+Although `--timestamp` will work without `--previous-bundle-location`, `BUNDLE` would then still be written and in the
 same directory as the timestamped bundles.
 
 If the previous bundle is not present, then `backup_bundle.py` will just create a full backup ('incremental' compared to
@@ -312,7 +329,7 @@ file is used. If `BUNDLE` is a directory, then all files matching glob `*.bundle
 Restoring bundles from a directory is done bundle by bundle. Whenever a bundle is successfully restored all other
 bundles will be attempted again, so as long as all necessary bundles are in the directory they will all be restored.
 For optimization purposes the bundles in a directory are ordered by their filename, which is optimal for a directory of
-bundles created with the `--timestamped` option.
+bundles created with the `--timestamp` option. This behavior can be altered with the `--strict-order` option.
 
 If `REPO` does not exist yet, it is created and intialized as a git repository.
 
@@ -323,6 +340,19 @@ repository will be created.
 
 This option has no effect if `REPO` is an existing git repository.
 
+### `-s`, `--strict-order`
+
+If `BUNDLE` is a directory, then the backup bundles in that directory are processed strictly in order of their
+filenames. If one bundle fails to be restored, then no attempts will be made to restore any of the other bundles.
+
+Because `--strict-order` provides guarantees to `backup-bundle.py` that the backup bundles in `BUNDLE` are correctly
+ordered, combining it with `--force` also convinces `backup-bundle.py` that they are up to date. As such, backup bundles
+without new commits will *not* be skipped, but have their reference updates restored to `REPO`.
+
+`--strict-order` is geared towards automated mirroring and assumes sufficiently reliable (automated) transport of the
+backup bundles, especially when using `--force`. Using `--timestamp` for creating the backup bundles is a natural
+combination, and it pairs well with `--skip-unchanged`.
+
 ### `-f`, `--force`
 
 Forcibly update `REPO`. This will allow:
@@ -331,11 +361,11 @@ Forcibly update `REPO`. This will allow:
 - Updates to the currently checked out branch while the worktree is not clean;
 - Removing the currently checked out branch with `--prune`.
 
-Additionally, if `BUNDLE` is a single file and contains no new commits, then it will still be restored in that all the
-references in `REPO` are updated to those in `BUNDLE`. Without `--force` a bundle with no new commits will be ignored,
-even if the references it has are different from those in `REPO`, because `backup_bundle.py` can't decide whether it's
-newer or older than the information in `REPO`. Using `--force` convinces `backup_bundle.py` that, yes, `BUNDLE` *is* the
-newest version.
+Additionally, if `BUNDLE` contains no new commits and is either a single file or `--strict-order` is given, then it will
+still be restored in that all the references in `REPO` are updated to those in `BUNDLE`. Without `--force` a bundle with
+no new commits will be ignored, even if the references it has are different from those in `REPO`, because
+`backup_bundle.py` can't decide whether it's newer or older than the information in `REPO`. Using `--force` convinces
+`backup_bundle.py` that, yes, `BUNDLE` *is* the newest version.
 
 ### `-p`, `--prune`
 
@@ -379,14 +409,14 @@ before the logger for `backup_bundle.py` is created.
 
 ### `--log-config`
 
-Provide a configuration for Python logging. `LOG_CONFIG` will be interpreted as JSOn, yielding a `dict` that will be
+Provide a configuration for Python logging. `LOG_CONFIG` will be interpreted as JSON, yielding a `dict` that will be
 passed to (`logging.config.configDict`)[https://docs.python.org/3/library/logging.config.html#logging.config.dictConfig]
 before the logger for `backup_bundle.py` is created.
 
 # Under the Hood
 
 `backup_bundle.py` is a wrapper around (git)[https://git-scm.com/] that basically enhances the functionality of
-`git bundle` and streamlines that for the usage scenarios describes above.
+`git bundle` and streamlines that for the usage scenarios described above.
 
 ## git Bundles
 
@@ -396,7 +426,7 @@ own documentation for details.
 ### Non-consecutive Commit Sets
 
 Although the underlying file format could probably handle it, `git bundle` does not allow creation of bundle files that
-contain non-consecutive commits within the same branch. See the (caveat about branches without commit)[#empty-branches]
+contain non-consecutive commits within the same branch. See the (caveat about branches without commits)[#empty-branches]
 for the user-facing implications.
 
     A -- B -- C -- D -- E main
@@ -493,7 +523,7 @@ this for restoring a single bundle (multiple bundles is just doing them one by o
 6. If the current HEAD points to a branch that would be deleted
   - `git switch --detach` to detach the HEAD
   - From this point on, we can treat the current HEAD as not being touched
-7. `git fetch` all the updated from the bundle
+7. `git fetch` all the updates from the bundle
   - Use `--update-head-ok` if needed to convince git that the current HEAD may be updated. The above steps fix any
     objections git may have had against it (but it would refuse anyway).
   - Update *all* heads (refspec `refs/heads/*:refs/heads/*`); with `--prune` this will remove branches that are no
@@ -543,9 +573,10 @@ bundle readily available on the filesystem.
 
 ### No Additional Dependencies
 
-Like with the one script file principle: one should need all kinds of additional packages to run a simple shell script.
+Like with the one script file principle: one should not need all kinds of additional packages to run a simple shell
+script.
 
-Optional dependencies that introduce end user convenience would be acceptable (`requests` to allow backup up to and
+Optional dependencies that introduce end user convenience would be acceptable (`requests` to allow backing up to and
 restoring from remote URIs, for example?).
 
 ### git-like Restraint
