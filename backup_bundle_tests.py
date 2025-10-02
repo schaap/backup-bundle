@@ -71,6 +71,8 @@ DEFAULT_ENVIRONMENT = {
 }
 """A default environment for calling git with. This prevents interference from missing git config."""
 
+UTF8 = "utf-8"
+
 log = getLogger(__name__)
 
 
@@ -202,7 +204,7 @@ def main_branch() -> str:
     """
     The name of the main branch to use in test repositories.
 
-    Do not call beofre the session has been initialized! In particular, if you need this in parameterizations you should
+    Do not call before the session has been initialized! In particular, if you need this in parameterizations you should
     provide indirection, for example by passing in a lambda that call this function, instead.
     """
     assert _main_branch_no_really_call_the_function_instead is not None, (
@@ -325,11 +327,11 @@ def add_commits(repo: Path, branch: str | None = None, *, count: int = 1, filena
 
         for _ in range(count):
             # Ensure we have some data to commit
-            current = file.read_text() if file.exists() else ""
+            current = file.read_text(encoding=UTF8) if file.exists() else ""
             new = current
             while new == current:
                 new = "".join(random.choices(ascii_letters, k=16))
-            file.write_text(new)
+            file.write_text(new, encoding=UTF8)
 
             # Create the commit
             call_git(["add", str(file)], cwd=Path())
@@ -350,19 +352,26 @@ def create_branch(repo: Path, branch: str, *, commit: str | None = None) -> str:
     return branch
 
 
-def change_branch(repo: Path, branch: str, *, new_commit: str | None) -> None:
+def change_branch(repo: Path, branch: str, *, new_commit: str) -> None:
     """
     Change an existing branch from a repository.
 
-    :param repo: The repo to remove the branch from.
-    :param branch: The branch to remove.
-    :param new_commit: The new commit to point the branch to. None to delete the branch.
+    :param repo: The repo to change the branch in.
+    :param branch: The branch to change.
+    :param new_commit: The new commit to point the branch to.
     """
-    if new_commit is None:
-        call_git(["switch", "--detach", call_git(["rev-parse", branch], cwd=repo)[0]], cwd=repo)
-        call_git(["branch", "--delete", "--force", branch], cwd=repo)
-    else:
-        call_git(["branch", "--force", branch, new_commit], cwd=repo)
+    call_git(["branch", "--force", branch, new_commit], cwd=repo)
+
+
+def delete_branch(repo: Path, branch: str) -> None:
+    """
+    Change an existing branch from a repository.
+
+    :param repo: The repo to change the branch in.
+    :param branch: The branch to change.
+    """
+    call_git(["switch", "--detach", call_git(["rev-parse", branch], cwd=repo)[0]], cwd=repo)
+    call_git(["branch", "--delete", "--force", branch], cwd=repo)
 
 
 def create_tag(repo: Path, tag: str, commit: str) -> str:
@@ -464,7 +473,7 @@ def test_unit_simple_lock_file() -> None:
     assert not lock_file.exists()
 
     # File already exists (lock fails)
-    lock_file.write_text("")
+    lock_file.write_text("", encoding=UTF8)
 
     assert lock_file.exists()
 
@@ -1066,7 +1075,7 @@ def test_create_only_includes_tags_with_metadata_option() -> None:
 
 def test_create_tags_incremental() -> None:
     """
-    Verify that backing up tags work incrementally.
+    Verify that backing up tags works incrementally.
     """
     bundles = [Path("bundle1.bundle"), Path("bundle2.bundle")]
     previous_bundle = Path("previous.bundle")
@@ -1201,6 +1210,231 @@ def test_create_creates_bundle_parent_directories() -> None:
     backup_bundle_main("create", origin, bundle)
 
     assert bundle.exists()
+
+
+def test_create_skip_unchanged_without_anything_new() -> None:
+    """
+    Verify that no bundle is created when there is nothing new and --skip-unchanged is passed.
+
+    Also verifies that a bundle is created with --skip-unchanged if there is no stored bundle, yet.
+
+    Also verifies that a metadata file is not written if a bundle is not created.
+    """
+    bundle = Path("bundle.bundle")
+    target = Path("target")
+    previous_bundle = Path("previous.bundle")
+    metadata = Path("metadata.json")
+
+    origin = create_repo("origin")
+    add_commits(origin)
+
+    # A bundle can be created with --skip-unchanged if there is no stored bundle, yet
+    backup_bundle_main("create", origin, bundle, "--previous-bundle", previous_bundle, "--skip-unchanged")
+
+    backup_bundle_main("restore", target, bundle, "--delete-files")
+    assert_repos_equal(origin, target)
+
+    # No bundle will be created with no changed
+    assert not bundle.exists()
+    backup_bundle_main("create", origin, bundle, "--previous-bundle", previous_bundle, "--skip-unchanged")
+
+    assert not bundle.exists()
+
+    # No bundle will be created with no changed, no metadata will be written since no bundle is written
+    backup_bundle_main(
+        "create", origin, bundle, "--previous-bundle", previous_bundle, "--metadata", metadata, "--skip-unchanged"
+    )
+
+    assert not bundle.exists()
+    assert not metadata.exists()
+
+
+def test_create_skip_unchanged_new_commit() -> None:
+    """
+    Verify that a bundle is created when there is a new commit and --skip-unchanged is passed.
+    """
+    bundle = Path("bundle.bundle")
+    target = Path("target")
+    previous_bundle = Path("previous.bundle")
+
+    origin = create_repo("origin")
+    add_commits(origin)
+
+    backup_bundle_main("create", origin, bundle, "--previous-bundle", previous_bundle)
+
+    backup_bundle_main("restore", target, bundle, "--delete-files")
+
+    add_commits(origin)
+
+    # A bundle will be created if there is a new commit
+    backup_bundle_main("create", origin, bundle, "--previous-bundle", previous_bundle, "--skip-unchanged")
+
+    assert bundle.exists()
+
+    backup_bundle_main("restore", target, bundle, "--delete-files")
+    assert_repos_equal(origin, target)
+
+
+@pytest.mark.parametrize("commit", ["b", "b~1"])
+def test_create_skip_unchanged_new_tag(commit: str) -> None:
+    """
+    Verify that a bundle is created when there is a new tag and --skip-unchanged is passed.
+
+    :param commit: Reference to the commit on which to put the tag.
+    """
+    bundle = Path("bundle.bundle")
+    target = Path("target")
+    previous_bundle = Path("previous.bundle")
+    metadata = Path("metadata.json")
+
+    origin = create_repo("origin")
+    add_commits(origin, count=2)
+    create_branch(origin, "b")
+
+    backup_bundle_main("create", origin, bundle, "--previous-bundle", previous_bundle, "--metadata", metadata)
+
+    backup_bundle_main("restore", target, bundle, "--delete-files")
+
+    create_tag(origin, "a_tag", commit)
+
+    # A bundle will be created if there is a new tag
+    backup_bundle_main(
+        "create", origin, bundle, "--previous-bundle", previous_bundle, "--metadata", metadata, "--skip-unchanged"
+    )
+
+    assert bundle.exists()
+
+    backup_bundle_main("restore", target, bundle, "--delete-files", "--force")
+    assert_repos_equal(origin, target)
+
+
+@pytest.mark.parametrize("commit", ["b", "b~1"])
+def test_create_skip_unchanged_new_branch(commit: str) -> None:
+    """
+    Verify that a bundle is created when there is a new branch and --skip-unchanged is passed.
+
+    :param commit: The commit on which to create the new branch.
+    """
+    bundle = Path("bundle.bundle")
+    target = Path("target")
+    previous_bundle = Path("previous.bundle")
+
+    origin = create_repo("origin")
+    add_commits(origin, count=2)
+    create_branch(origin, "b")
+
+    backup_bundle_main("create", origin, bundle, "--previous-bundle", previous_bundle)
+
+    backup_bundle_main("restore", target, bundle, "--delete-files")
+
+    create_branch(origin, "b2", commit=commit)
+
+    # A bundle will be created if there is a new branch
+    backup_bundle_main("create", origin, bundle, "--previous-bundle", previous_bundle, "--skip-unchanged")
+
+    assert bundle.exists()
+
+    backup_bundle_main("restore", target, bundle, "--delete-files", "--force")
+    assert_repos_equal(origin, target)
+
+
+@pytest.mark.parametrize("commit", ["b", "b~1", "b~3"])
+def test_create_skip_unchanged_changed_branch(commit: str) -> None:
+    """
+    Verify that a bundle is created when a branch was changed and --skip-unchanged is passed.
+
+    :param commit: The commit to which to change the branch.
+    """
+    bundle = Path("bundle.bundle")
+    target = Path("target")
+    previous_bundle = Path("previous.bundle")
+
+    origin = create_repo("origin")
+    add_commits(origin, count=4)
+    create_branch(origin, "b")
+    create_branch(origin, "b2", commit="b~2")
+
+    backup_bundle_main("create", origin, bundle, "--previous-bundle", previous_bundle)
+
+    backup_bundle_main("restore", target, bundle, "--delete-files")
+
+    change_branch(origin, "b2", new_commit=commit)
+
+    # A bundle will be created if a branch is changed
+    backup_bundle_main("create", origin, bundle, "--previous-bundle", previous_bundle, "--skip-unchanged")
+
+    assert bundle.exists()
+
+    backup_bundle_main("restore", target, bundle, "--delete-files", "--force")
+    assert_repos_equal(origin, target)
+
+
+@pytest.mark.parametrize("commit", ["b", "b~1", "b~2"])
+def test_create_skip_unchanged_removed_branch(commit: str) -> None:
+    """
+    Verify that a bundle is created when a branch was removed and --skip-unchanged is passed.
+
+    :param str: The commit on which the removed branch was placed.
+    """
+    bundle = Path("bundle.bundle")
+    target = Path("target")
+    previous_bundle = Path("previous.bundle")
+
+    origin = create_repo("origin")
+    add_commits(origin, count=3)
+    create_branch(origin, "b")
+    create_branch(origin, "b2", commit="b~1")
+    create_branch(origin, "b3", commit=commit)
+
+    backup_bundle_main("create", origin, bundle, "--previous-bundle", previous_bundle)
+
+    backup_bundle_main("restore", target, bundle, "--delete-files")
+
+    delete_branch(origin, "b3")
+
+    # A bundle will be created if a branch is removed
+    backup_bundle_main("create", origin, bundle, "--previous-bundle", previous_bundle, "--skip-unchanged")
+
+    assert bundle.exists()
+
+    backup_bundle_main("restore", target, bundle, "--delete-files", "--force", "--prune")
+    assert_repos_equal(origin, target)
+
+
+def test_create_skip_unchanged_new_tag_but_no_tags_included() -> None:
+    """
+    Verify that no bundle is created when there is a new tag and --skip-unchanged is passed, but tags are not included.
+
+    Also verifies that a bundle will be created when there is a tag and tags are included for the first time, and that
+    metadata will then also be written.
+    """
+    bundle = Path("bundle.bundle")
+    target = Path("target")
+    previous_bundle = Path("previous.bundle")
+    metadata = Path("metadata.json")
+
+    origin = create_repo("origin")
+    add_commits(origin, count=3)
+
+    backup_bundle_main("create", origin, bundle, "--previous-bundle", previous_bundle)
+
+    backup_bundle_main("restore", target, bundle, "--delete-files")
+
+    create_tag(origin, "a_tag", commit=f"{main_branch()}~1")
+
+    # No bundle is created if there is a new tag and --skip-unchanged is passed, but tags are not included
+    backup_bundle_main("create", origin, bundle, "--previous-bundle", previous_bundle, "--skip-unchanged")
+
+    assert not bundle.exists()
+
+    # A bundle is created after all if tags are then included, and metadata is then written, as well
+    backup_bundle_main(
+        "create", origin, bundle, "--previous-bundle", previous_bundle, "--metadata", metadata, "--skip-unchanged"
+    )
+
+    backup_bundle_main("restore", target, bundle, "--delete-files", "--force")
+    assert_repos_equal(origin, target)
+    assert metadata.exists()
 
 
 # #############################
@@ -1699,7 +1933,7 @@ def test_restore_remove_branch_in_incremental_update_requires_prune(*, prune: bo
     backup_bundle_main("create", origin, bundles[0], "--previous-bundle-location", previous_bundle)
 
     # Remove the branch, and add a commit so we can make an incremental backup
-    change_branch(origin, branch, new_commit=None)
+    delete_branch(origin, branch)
     add_commits(origin)
 
     backup_bundle_main("create", origin, bundles[1], "--previous-bundle-location", previous_bundle)
@@ -1876,7 +2110,7 @@ def test_restore_remove_checked_out_branch_in_incremental_update_requires_force(
     backup_bundle_main("create", origin, bundles[0], "--previous-bundle-location", previous_bundle)
 
     # Remove the branch, and add a commit so we can make an incremental backup
-    change_branch(origin, branch, new_commit=None)
+    delete_branch(origin, branch)
     add_commits(origin)
 
     backup_bundle_main("create", origin, bundles[1], "--previous-bundle-location", previous_bundle)
@@ -1985,7 +2219,7 @@ def test_restore_with_lock_file() -> None:
 
     backup_bundle_main("create", origin, bundle)
 
-    lock_file.write_text("")
+    lock_file.write_text("", encoding=UTF8)
 
     # Restore with a lock file that already exists does not fail but also doesn't restore anything
     backup_bundle_main("restore", target, bundle, "--lock-file", lock_file, "--delete-files")
@@ -2003,3 +2237,193 @@ def test_restore_with_lock_file() -> None:
     assert_repos_equal(origin, target)
     assert not lock_file.exists()
     assert not bundle.exists()
+
+
+def test_restore_strict_order_applies_force() -> None:
+    """
+    Verify that bundles are restored with --force when restoring a directory with --strict-order.
+
+    Also verifies that restoring a directory with --strict-order works.
+    """
+    bundle_dir = Path("bundles")
+    bundles = [
+        bundle_dir / "bundle1.bundle",
+        bundle_dir / "bundle2.bundle",
+    ]
+    target = Path("target")
+    previous_bundle = Path("previous.bundle")
+
+    origin = create_repo("origin")
+    add_commits(origin)
+    create_branch(origin, "b")
+    create_branch(origin, "b2")
+
+    backup_bundle_main("create", origin, bundles[0], "--previous-bundle", previous_bundle)
+
+    add_commits(origin)
+
+    backup_bundle_main("create", origin, bundles[0], "--previous-bundle", previous_bundle)
+
+    # Restoring a directory with --strict-order works
+    backup_bundle_main("restore", target, bundle_dir, "--strict-order", "--delete-files")
+
+    assert_repos_equal(origin, target)
+
+    change_branch(origin, "b", new_commit=main_branch())
+
+    backup_bundle_main("create", origin, bundles[0], "--previous-bundle", previous_bundle)
+
+    change_branch(origin, "b2", new_commit=main_branch())
+
+    backup_bundle_main("create", origin, bundles[1], "--previous-bundle", previous_bundle)
+
+    # Restoring a directory with --strict-order and --force applies --force to each file in the directory
+    backup_bundle_main("restore", target, bundle_dir, "--strict-order", "--force", "--delete-files")
+
+    assert_repos_equal(origin, target)
+
+
+def test_restore_strict_order_does_not_continue_after_failed_restore() -> None:
+    """
+    Verify that when a single bundle in a directory being restored with --strict-order fails to restore, the remaining
+    bundles are not attempted.
+    """
+    bundle_dir = Path("bundles")
+    bundles = [
+        bundle_dir / "bundle1.bundle",
+        bundle_dir / "bundle2.bundle",
+    ]
+    target = Path("target")
+    intermediate = Path("intermediate")
+    previous_bundle = Path("previous.bundle")
+    previous_bundle_copy = Path("previous.copy.bundle")
+
+    origin = create_repo("origin")
+    add_commits(origin)
+
+    backup_bundle_main("create", origin, bundles[0], "--previous-bundle", previous_bundle)
+
+    # Backup current state
+    backup_bundle_main("restore", intermediate, bundle_dir, "--strict-order")
+    copy(previous_bundle, previous_bundle_copy)
+
+    backup_bundle_main("restore", target, bundle_dir, "--strict-order", "--delete-files")
+
+    add_commits(origin)
+
+    backup_bundle_main("create", origin, bundles[0], "--previous-bundle", previous_bundle)
+
+    add_commits(origin)
+
+    # Overwrite bundles[0] to create a missing bundle
+    backup_bundle_main("create", origin, bundles[0], "--previous-bundle", previous_bundle)
+
+    # Create bundles[1] which contains both new commits and *could* be restored
+    backup_bundle_main("create", origin, bundles[1], "--previous-bundle", previous_bundle_copy)
+
+    # Restoring the directory does not restore anything as the first bundle fails to restore
+    with pytest.raises(NoBundlesRestoredError):
+        backup_bundle_main("restore", target, bundle_dir, "--strict-order", "--delete-files")
+
+    assert all(bundle.exists() for bundle in bundles)
+    assert_repos_equal(intermediate, target)
+
+    # Restoring the directory is possible without --strict-order thanks to the second bundle
+    backup_bundle_main("restore", target, bundle_dir, "--delete-files")
+
+    assert_repos_equal(origin, target)
+
+
+def test_restore_strict_order_does_not_continue_after_bad_head_update() -> None:
+    """
+    Verify that when a bundle in a directory being restored with --strict-order would be a bad head update, the
+    remaining bundles are not attempted.
+
+    Also verify that a bad head update can still be forced with --strict-order and --force.
+
+    Also verify that --strict-order does not imply --force.
+    """
+    bundle_dir = Path("bundles")
+    bundles = [
+        bundle_dir / "bundle1.bundle",
+        bundle_dir / "bundle2.bundle",
+    ]
+    target = Path("target")
+    intermediate = Path("intermediate")
+    previous_bundle = Path("previous.bundle")
+    updated_file = "a_file_in_the_repo"
+    dirty_target_file = target / updated_file
+
+    origin = create_repo("origin")
+    add_commits(origin, count=3, filename=updated_file)
+    create_branch(origin, "b")
+
+    backup_bundle_main("create", origin, bundles[0], "--previous-bundle", previous_bundle)
+
+    # Backup current state
+    backup_bundle_main("restore", intermediate, bundle_dir, "--strict-order")
+
+    backup_bundle_main("restore", target, bundle_dir, "--strict-order", "--delete-files")
+
+    call_git(["switch", "b"], cwd=target)
+    dirty_target_file.write_text(dirty_target_file.read_text(encoding=UTF8) + "DIRTIED", encoding=UTF8)
+
+    change_branch(origin, "b", new_commit="b~1")
+    add_commits(origin)
+
+    backup_bundle_main("create", origin, bundles[0], "--previous-bundle", previous_bundle)
+
+    # Checkout b and dirty the worktree, so we can't cleanly perform a HEAD update
+    change_branch(origin, "b", new_commit=main_branch())
+    add_commits(origin)
+
+    backup_bundle_main("create", origin, bundles[1], "--previous-bundle", previous_bundle)
+
+    # Restoring the directory does not restore anything as the first bundle fails to restore due to a bad head update
+    with pytest.raises(NoBundlesRestoredError):
+        backup_bundle_main("restore", target, bundle_dir, "--strict-order", "--delete-files")
+
+    assert all(bundle.exists() for bundle in bundles)
+    assert_repos_equal(intermediate, target)
+
+    # Restoring the directory is possible with --strict-order and --force.
+    # This also verifies that --strict-order did not previously imply --force.
+    backup_bundle_main("restore", target, bundle_dir, "--strict-order", "--force", "--delete-files")
+
+    assert_repos_equal(origin, target)
+
+
+def test_restore_strict_order_without_force_does_not_stop_on_reference_only_bundle() -> None:
+    """
+    Verify that restoring a directory with --strict-order but without --force is not interrupted by a bundle that only
+    contains reference updates (and isn't actually restored because it already was).
+    """
+    bundle_dir = Path("bundles")
+    bundles = [
+        bundle_dir / "bundle1.bundle",
+        bundle_dir / "bundle2.bundle",
+    ]
+    target = Path("target")
+    previous_bundle = Path("previous.bundle")
+
+    origin = create_repo("origin")
+    add_commits(origin, count=3)
+    create_branch(origin, "b")
+
+    backup_bundle_main("create", origin, bundles[0], "--previous-bundle", previous_bundle)
+
+    backup_bundle_main("restore", target, bundle_dir, "--strict-order", "--delete-files")
+
+    change_branch(origin, "b", new_commit="b~1")
+
+    backup_bundle_main("create", origin, bundles[0], "--previous-bundle", previous_bundle)
+
+    change_branch(origin, "b", new_commit=main_branch())
+    add_commits(origin)
+
+    backup_bundle_main("create", origin, bundles[1], "--previous-bundle", previous_bundle)
+
+    # Restoring the directory works as expected: the reference update bundles[0] is effectively skipped
+    backup_bundle_main("restore", target, bundle_dir, "--strict-order", "--delete-files")
+
+    assert_repos_equal(origin, target)
