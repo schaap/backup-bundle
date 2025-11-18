@@ -712,11 +712,17 @@ class Restoration:
         :param new_references: The new references to update the local repository to.
         :return: True iff HEAD should be detached before (force-)fetching the updates.
         """
-        if self.current_branch_name:
+        if not self._is_repo_bare and self.current_branch_name:
             new_ref_for_current_branch = [
                 ref for ref in new_references if ref.ref == f"refs/heads/{self.current_branch_name}"
             ]
-            if self.force and not new_ref_for_current_branch:
+
+            # If there is no new reference for the current branch and force is used, then we should detach HEAD first,
+            # if that is possible.
+            #
+            # The initial branch of a new and empty repository can't be switched away from, but may be overwritten
+            # for free. The git call checks if the repository has a HEAD at all to detect the empty repository.
+            if self.force and not new_ref_for_current_branch and try_call_git(["rev-parse", "HEAD"], cwd=self.repo):
                 # This will delete the current branch. HEAD needs to be detached first.
                 return True
         return False
