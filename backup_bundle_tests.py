@@ -271,7 +271,14 @@ def assert_repos_not_equal(repo1: Path, repo2: Path) -> None:
     assert set(refs1) != set(refs2)
 
 
-def create_repo(repo: Path | str, *, clone: Path | str | None = None, bare: bool = False, mirror: bool = False) -> Path:
+def create_repo(
+    repo: Path | str,
+    *,
+    clone: Path | str | None = None,
+    bare: bool = False,
+    mirror: bool = False,
+    initial_branch: str | None = None,
+) -> Path:
     """
     Create a git repository in repo.
 
@@ -279,6 +286,7 @@ def create_repo(repo: Path | str, *, clone: Path | str | None = None, bare: bool
     :param clone: If set, clone from this source.
     :param bare: Create a bare repository.
     :param mirror: Create a mirrored clone.
+    :param initial_branch: If set, the name of the initial branch of the repository.
     :returns: `repo`
     """
     if isinstance(repo, str):
@@ -288,6 +296,7 @@ def create_repo(repo: Path | str, *, clone: Path | str | None = None, bare: bool
     repo.mkdir(parents=True, exist_ok=True)
     options: list[str] = []
     if clone is not None:
+        assert initial_branch is None, "initial_branch makes no sense if cloning"
         if mirror:
             options = ["--mirror"]
         elif bare:
@@ -297,6 +306,8 @@ def create_repo(repo: Path | str, *, clone: Path | str | None = None, bare: bool
         assert not mirror, "mirror makes no sense if not cloning"
         if bare:
             options = ["--bare"]
+        if initial_branch:
+            options += ["--initial-branch", initial_branch]
         call_git(["init", *options, "."], cwd=repo)
     return repo
 
@@ -2425,5 +2436,43 @@ def test_restore_strict_order_without_force_does_not_stop_on_reference_only_bund
 
     # Restoring the directory works as expected: the reference update bundles[0] is effectively skipped
     backup_bundle_main("restore", target, bundle_dir, "--strict-order", "--delete-files")
+
+    assert_repos_equal(origin, target)
+
+
+@pytest.mark.parametrize(
+    ("bare", "empty_repo"),
+    [
+        (True, False),
+        (False, False),
+        (True, True),
+        (False, True),
+    ],
+)
+def test_restore_to_repo_with_different_main_branch(*, bare: bool, empty_repo: bool) -> None:
+    """
+    Verify that restoring into a repository works correctly, even if the restored data does not contain the same default
+    (main) branch as the repository being restored to.
+
+    :param bare: Whether the new repository is initialized as a bare repository.
+    :param empty_repo: whether the new repository will be entirely empty.
+    """
+    bundle = Path("bundle.bundle")
+    second_bundle = Path("second.bundle")
+
+    origin = create_repo("origin", initial_branch="initial")
+    add_commits(origin, count=3)
+
+    backup_bundle_main("create", origin, bundle)
+
+    target = create_repo("target", bare=bare, initial_branch="somethingelse")
+    if not empty_repo:
+        # Add commits using a create/restore to allow adding commits to a bare repository
+        second_origin = create_repo("second_origin", initial_branch="somethingelse")
+        add_commits(second_origin, count=2)
+        backup_bundle_main("create", second_origin, second_bundle)
+        backup_bundle_main("restore", target, second_bundle, "--force", "--prune")
+
+    backup_bundle_main("restore", target, bundle, "--force", "--prune")
 
     assert_repos_equal(origin, target)
