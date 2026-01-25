@@ -347,7 +347,8 @@ filenames. If one bundle fails to be restored, then no attempts will be made to 
 
 Because `--strict-order` provides guarantees to `backup-bundle.py` that the backup bundles in `BUNDLE` are correctly
 ordered, combining it with `--force` also convinces `backup-bundle.py` that they are up to date. As such, backup bundles
-without new commits will *not* be skipped, but have their reference updates restored to `REPO`.
+without new commits will *not* be skipped, but have all their reference updates restored to `REPO` (instead of only
+new tags).
 
 `--strict-order` is geared towards automated mirroring and assumes sufficiently reliable (automated) transport of the
 backup bundles, especially when using `--force`. Using `--timestamp` for creating the backup bundles is a natural
@@ -364,8 +365,8 @@ Forcibly update `REPO`. This will allow:
 Additionally, if `BUNDLE` contains no new commits and is either a single file or `--strict-order` is given, then it will
 still be restored in that all the references in `REPO` are updated to those in `BUNDLE`. Without `--force` a bundle with
 no new commits will be ignored, even if the references it has are different from those in `REPO`, because
-`backup_bundle.py` can't decide whether it's newer or older than the information in `REPO`. Using `--force` convinces
-`backup_bundle.py` that, yes, `BUNDLE` *is* the newest version.
+`backup_bundle.py` can't decide whether it's newer or older than the information in `REPO` - only new tags fomr the
+ignored would be restored. Using `--force` convinces `backup_bundle.py` that, yes, `BUNDLE` *is* the newest version.
 
 ### `-p`, `--prune`
 
@@ -503,7 +504,8 @@ this for restoring a single bundle (multiple bundles is just doing them one by o
 
 1. Check if the commits referenced in the bundle already exist in the repository
   - If all of them already exist, then the bundle contains no new updates. It is skipped (but see the exception with
-    `--force`)
+    `--force`). An attempt to restore new tags from the bundle is still attempted, irrespective of `--force`; this is
+    basically just the last part of step 7
 2. Detect an update to the current HEAD (i.e. currently checked out branch)
   - In a bare repository: no problem
     - HEAD is rather meaningless in a bare repository, as there is no checkout

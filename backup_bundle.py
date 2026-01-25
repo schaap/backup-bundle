@@ -838,6 +838,8 @@ class Restoration:
         """
         Perform the actual bundle restore.
 
+        This includes any tags in the bundle.
+
         :param bundle: The bundle being fetched.
         :param new_references: The new references that are available in bundle.
         :param force_update_head: Whether an update to head must be forcibly allowed using --update-head-ok.
@@ -908,6 +910,46 @@ class Restoration:
 
         return True
 
+    def _try_restore_tags(self, bundle: Path, new_references: list[GitRef]) -> None:
+        """
+        Restore all tags in the bundle.
+
+        :param bundle: The bundle being fetched.
+        :param new_references: The new references that are available in bundle.
+        """
+        update_tags = [f"{ref.ref}:{ref.ref}" for ref in new_references if ref.ref.startswith("refs/tags/")]
+        if not update_tags:
+            # No tags in the bundle. They've all been restored.
+            return
+
+        git_fetch_arguments = [
+            "--atomic",
+            "--tags",
+            "--no-write-fetch-head",
+            *self.force_and_prune,
+            str(bundle.absolute()),
+            # Note that we can't use refs/tags/*:refs/tags/* : that would start purging tags even without
+            # --prune-tags. See `git fetch` documentation, section Pruning, for more details.
+            *update_tags,
+        ]
+
+        log.info("Attempting to restore tags from %s", bundle)
+
+        # Perform checks and a dry-run first, to ensure that changes are only made if the entire bundle can be
+        # processed. This is nicer for the user, but keeps the bundle available for another attempt later on
+        # (as opposed to being seen as fully restored due to all the commits already having been fetched into the
+        # repository).
+        try:
+            self._dry_run_git_fetch(bundle, git_fetch_arguments)
+        except GitCallFailedError:
+            # Restoring tags from bundle failed. This can occur if we're missing data. It's not an error.
+            log.warning("Bundle %s contains tag references, but restoring those has failed", bundle)
+
+        # After the checks above, actually restoring tags from the bundle is expected not to fail.
+        call_git(["fetch", *git_fetch_arguments], cwd=self.repo)
+
+        log.info("Restored tags from bundle %s", bundle)
+
     @staticmethod
     def _list_bundles(bundle: Path) -> list[Path]:
         """
@@ -940,7 +982,8 @@ class Restoration:
                              with no cycling over the bundles to attempt to restore other bundles when one fails to be
                              restored.
         :return: The total number of bundles found. If bundle is a file this is 1, otherwise it's the number of bundle
-                 files found in the directory bundle points to.
+                 files found in the directory bundle points to. Bundles that only contained new tags and not actual
+                 commits are not counted.
         """
         # Figure out which bundle files to handle
         bundles = Restoration._list_bundles(bundle)
@@ -973,6 +1016,7 @@ class Restoration:
                 apply_force = self.force and (strict_order or bundle.is_file())
                 if not apply_force and are_available(self.repo, references[current_bundle]):
                     log.warning("Bundle %s has already been restored", current_bundle)
+                    self._try_restore_tags(current_bundle, references[current_bundle])
                     restore_more_bundles |= self._mark_bundle_restored(current_bundle, was_already_restored=True)
                     continue
 
@@ -1136,7 +1180,7 @@ def main(argv: list[str]) -> None:
         type=Path,
         help=(
             "The location to store the latest bundle. If left empty it will be the same as the created bundle. This is "
-            "the reference point for creating incremental backups."
+            "also used as the reference point for creating incremental backups."
         ),
     )
     backup_parser.add_argument(
