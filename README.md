@@ -365,7 +365,7 @@ Forcibly update `REPO`. This will allow:
 Additionally, if `BUNDLE` contains no new commits and is either a single file or `--strict-order` is given, then it will
 still be restored in that all the references in `REPO` are updated to those in `BUNDLE`. Without `--force` a bundle with
 no new commits will be ignored, even if the references it has are different from those in `REPO`, because
-`backup_bundle.py` can't decide whether it's newer or older than the information in `REPO` - only new tags fomr the
+`backup_bundle.py` can't decide whether it's newer or older than the information in `REPO` - only new tags from the
 ignored would be restored. Using `--force` convinces `backup_bundle.py` that, yes, `BUNDLE` *is* the newest version.
 
 ### `-p`, `--prune`

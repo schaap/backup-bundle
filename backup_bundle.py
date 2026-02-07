@@ -944,6 +944,7 @@ class Restoration:
         except GitCallFailedError:
             # Restoring tags from bundle failed. This can occur if we're missing data. It's not an error.
             log.warning("Bundle %s contains tag references, but restoring those has failed", bundle)
+            return
 
         # After the checks above, actually restoring tags from the bundle is expected not to fail.
         call_git(["fetch", *git_fetch_arguments], cwd=self.repo)
