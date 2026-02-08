@@ -1,7 +1,7 @@
 # Incremental Git Backups Using Git Bundle
 
 <!--
-    Copyright (c)  2025  Thomas Schaap
+    Copyright (c)  2025-2026  Thomas Schaap
     Permission is granted to copy, distribute and/or modify this document
     under the terms of the GNU Free Documentation License, Version 1.3
     or any later version published by the Free Software Foundation;
@@ -255,6 +255,26 @@ very least stash it. Having it staged for committing is *not* enough. And when y
 again without `--force` - especially `backup_bundle.py` tries very hard to do the right thing, as long as your worktree
 is clean. Chances are all you'll need to do then is rebase or merge your own work on the successfully restored updates.
 
+### 'Default' Branches and `HEAD`
+
+The concept of a default branch, although not unknown in the Git community, essentially does not exist. An excellent
+write-up was provided by user torek in (answer to a question on StackOverflow about default branches in
+Git)[https://stackoverflow.com/a/65710958]. The main points from torek's answer: there is only a configurable default
+initial branch, and a remote repository's `HEAD` simply refers to a branch as recommended by that repository's owner.
+Oftentimes people will simply clone a remote repository, work with the branches provided there, and consider the
+repository owner's recommendation as authoritative - this seems to be what is most commonly referred to as the default
+branch. But this concept falls apart when multiple remote repositories are used, especially if those repositories have
+different recommendations.
+
+`backup_bundle.py` does not attempt to settle this debate. Instead, a backup bundle will simply contain the local `HEAD`
+of the repository. When restoring a backup bundle into a repository that does not currently have a `HEAD` set yet, which
+usually means that it's a new bare repository created by `backup_bundle.py`, the backup bundle will be analyzed to try
+and find which branch the source repository's `HEAD` referred to. This is then used to create a local symbolic reference
+for `HEAD`.
+
+The conservative restoration of `HEAD` allows `backup_bundle.py` to be used to clone a repository via a backup bundle,
+and use the original repository's recommended branch similar to how `git clone` would do this.
+
 # Command Line Parameters {#cmd-params}
 
 The two general forms of calling `backup_bundle.py` are:
@@ -332,6 +352,10 @@ For optimization purposes the bundles in a directory are ordered by their filena
 bundles created with the `--timestamp` option. This behavior can be altered with the `--strict-order` option.
 
 If `REPO` does not exist yet, it is created and intialized as a git repository.
+
+If `REPO` does not have a `HEAD` reference, yet, it will be set to a branch identified in the backup bundle. This may
+not succeed if the source repository had a detached `HEAD` or has multiple branches pointing to the commit `HEAD` points
+at. In such cases this step is simply skipped and may later on be attempted again.
 
 ### `-b`, `--bare`
 
