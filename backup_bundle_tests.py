@@ -1,5 +1,5 @@
 # backup_bundle.py: incremental backup of git repositories based on git bundle
-# Copyright (C) 2025  Thomas Schaap
+# Copyright (C) 2025-2026  Thomas Schaap
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -193,62 +193,72 @@ def try_call_git(arguments: list[str], *, cwd: Path) -> list[str]:
         return []
 
 
-_main_branch_no_really_call_the_function_instead: str | None = None
+_default_branch_no_really_call_the_function_instead: str | None = None
 """
-The name of the main branch to use in test repositories.
+The name of the default branch to use in test repositories.
 
-DO NOT USE! Call `main_branch()`, instead.
+DO NOT USE! Call `default_branch()`, instead.
 """
 
 
-def main_branch() -> str:
+def default_branch() -> str:
     """
-    The name of the main branch to use in test repositories.
+    The name of the default branch to use in test repositories.
 
     Do not call before the session has been initialized! In particular, if you need this in parameterizations you should
     provide indirection, for example by passing in a lambda that call this function, instead.
     """
-    assert _main_branch_no_really_call_the_function_instead is not None, (
-        "Do not call upon main_branch() before the session has been initialized."
+    assert _default_branch_no_really_call_the_function_instead is not None, (
+        "Do not call upon default_branch() before the session has been initialized."
     )
-    return _main_branch_no_really_call_the_function_instead
+    return _default_branch_no_really_call_the_function_instead
 
 
 @pytest.fixture(scope="session", autouse=True)
-def determine_main_branch() -> str:
+def determine_default_branch() -> str:
     """
-    Fixture to determine the main branch of new git repositories.
+    Fixture to determine the default branch of new git repositories.
 
-    This will initialize `main_branch()`.
+    This will initialize `default_branch()`.
 
-    :yields: The name of the main branch.
+    :yields: The name of the default branch.
     """
-    global _main_branch_no_really_call_the_function_instead  # noqa: PLW0603
+    global _default_branch_no_really_call_the_function_instead  # noqa: PLW0603
 
     # The only reliable way to figure this out is by creating a new repository.
     with TemporaryDirectory() as tmp:
         branch_name, _ = get_current_branch(create_repo(tmp))
 
     assert branch_name
-    _main_branch_no_really_call_the_function_instead = branch_name
+    _default_branch_no_really_call_the_function_instead = branch_name
     return branch_name
 
 
-def assert_repos_equal(repo1: Path, repo2: Path) -> None:
+def assert_repos_equal(repo1: Path, repo2: Path, *, include_head: bool = True) -> None:
     """
     Assert that two repositories contains the same references and reachable commits for those references.
 
     Bundle files are not supported.
 
+    If HEAD is included in the comparison, an additional check is done to verify that HEAD is the same symbolic
+    reference in both repositories (or detached in both).
+
     :param repo1: The one repo to check.
     :param repo2: The other repo to check.
+    :param include_head: Whether to compare HEAD, as well. Set to False for those cases where the HEAD is not expected
+                         to be the same in the two repositories.
     """
     assert repo1.resolve() != repo2.resolve(), "You probably meant to compare two *different* repos."
     refs1 = list_references_in_repo(repo1)
     refs2 = list_references_in_repo(repo2)
+    if not include_head:
+        refs1 = [ref for ref in refs1 if ref.ref != "HEAD"]
+        refs2 = [ref for ref in refs2 if ref.ref != "HEAD"]
     assert set(refs1) == set(refs2)
     for ref in refs1:
         assert call_git(["rev-list", ref.ref], cwd=repo1) == call_git(["rev-list", ref.ref], cwd=repo2)
+    if include_head:
+        assert try_call_git(["symbolic-ref", "HEAD"], cwd=repo1) == try_call_git(["symbolic-ref", "HEAD"], cwd=repo2)
 
 
 def assert_repos_not_equal(repo1: Path, repo2: Path) -> None:
@@ -320,17 +330,17 @@ def add_commits(repo: Path, branch: str | None = None, *, count: int = 1, filena
     Each commit will overwrite the same file with a random string of the same length.
 
     :param repo: The repo to commit on.
-    :param branch: The branch to create commits on. Defaults to `main_branch()`.
+    :param branch: The branch to create commits on. Defaults to `default_branch()`.
     :param count: The number of commits to add.
     :param filename: The name of the file that will be updated in every commit.
     """
     assert not is_bare_repo(repo), "Can't create commits on bare repo"
     assert count >= 0
 
-    branch = branch or main_branch()
+    branch = branch or default_branch()
 
-    # Detect an empty repository (= main branch, no commits yet). Otherwise switch to the requested branch.
-    if branch != main_branch() or try_call_git(["rev-parse", main_branch()], cwd=repo):
+    # Detect an empty repository (= default branch, no commits yet). Otherwise switch to the requested branch.
+    if branch != default_branch() or try_call_git(["rev-parse", default_branch()], cwd=repo):
         call_git(["switch", "--no-guess", branch], cwd=repo)
 
     # Create the commits
@@ -350,16 +360,28 @@ def add_commits(repo: Path, branch: str | None = None, *, count: int = 1, filena
             call_git(["commit", "-m", "Another commit"], cwd=Path())
 
 
+def switch_branch(repo: Path, branch: str) -> str:
+    """
+    Switch to the named branch in a repository.
+
+    :param repo: The repo to switch branches in.
+    :param branch: The name of the branch to switch to.
+    :returns: `branch`
+    """
+    call_git(["switch", branch], cwd=repo)
+    return branch
+
+
 def create_branch(repo: Path, branch: str, *, commit: str | None = None) -> str:
     """
     Create a new branch on a repository.
 
     :param repo: The repo to add a branch in.
     :param branch: The name of the branch to create.
-    :param commit: Start the new branch from this commit. Defaults to `main_branch()`.
+    :param commit: Start the new branch from this commit. Defaults to `default_branch()`.
     :returns: `branch`
     """
-    commit = commit or main_branch()
+    commit = commit or default_branch()
     call_git(["branch", branch, commit], cwd=repo)
     return branch
 
@@ -456,23 +478,23 @@ def test_unit_get_current_branch() -> None:
     repo = create_repo("repo")
     bare_repo = create_repo("bare", clone=repo, bare=True, mirror=True)
 
-    # A new repository returns only the name of the main branch
-    assert (main_branch(), None) == get_current_branch(repo)
-    assert (main_branch(), None) == get_current_branch(bare_repo)
+    # A new repository returns only the name of the default branch
+    assert (default_branch(), None) == get_current_branch(repo)
+    assert (default_branch(), None) == get_current_branch(bare_repo)
 
     add_commits(repo)
     call_git(["remote", "update"], cwd=bare_repo)
 
     # A normal checkout returns the name of the branch and the checked out commit
     branch, ref = get_current_branch(repo)
-    assert branch == main_branch()
+    assert branch == default_branch()
     assert ref is not None
-    assert ref.ref == f"refs/heads/{main_branch()}"
+    assert ref.ref == f"refs/heads/{default_branch()}"
 
     branch, ref = get_current_branch(bare_repo)
-    assert branch == main_branch()
+    assert branch == default_branch()
     assert ref is not None
-    assert ref.ref == f"refs/heads/{main_branch()}"
+    assert ref.ref == f"refs/heads/{default_branch()}"
 
     # Switch to a detached head (the update-ref is the plumbing way to do the same in a bare repo)
     call_git(["switch", "--detach"], cwd=repo)
@@ -546,7 +568,7 @@ def test_create_full() -> None:
 
     origin = create_repo("origin", bare=False)
     add_commits(origin, count=3)
-    b1 = create_branch(origin, "b1", commit=f"{main_branch()}~2")
+    b1 = create_branch(origin, "b1", commit=f"{default_branch()}~2")
     add_commits(origin, b1, count=4)
     b2 = create_branch(origin, "b2")
     add_commits(origin, b2, count=2)
@@ -561,6 +583,7 @@ def test_create_full() -> None:
     backup_bundle_main("restore", target, bundle, "--force")
 
     # Full restore succeeded
+    switch_branch(origin, default_branch())
     assert_repos_equal(origin, target)
 
 
@@ -616,7 +639,7 @@ def test_create_includes_unchanged_references() -> None:
 
     origin = create_repo("origin")
     add_commits(origin, count=2)
-    b1 = create_branch(origin, "b1", commit=f"{main_branch()}~1")
+    b1 = create_branch(origin, "b1", commit=f"{default_branch()}~1")
     add_commits(origin, b1, count=10)
     create_branch(origin, "b2", commit=f"{b1}~7")
 
@@ -624,7 +647,7 @@ def test_create_includes_unchanged_references() -> None:
 
     backup_bundle_main("create", origin, bundles[0], "--previous-bundle-location", previous_bundle)
 
-    # Note that the new commits are made on the main branch, so b1, b2 and le_tag are not reachable from them
+    # Note that the new commits are made on the default branch, so b1, b2 and le_tag are not reachable from them
     add_commits(origin, count=2)
 
     backup_bundle_main("create", origin, bundles[1], "--previous-bundle-location", previous_bundle)
@@ -665,7 +688,7 @@ def _generate_distances() -> Generator[tuple[int, int, int], None, None]:
     list(_generate_distances()),
     # Because it's impractical to find all corner cases, a whole string of tests is attempted. For this, git repos with
     # a history like below are created, with the branches' locations parameterised by their distance from the previous
-    # one (or the main branch):
+    # one (or the default branch):
     #
     # commit 8B8B (HEAD, main)     --\
     # commit 7777                    |-> distance1 (= 2)
@@ -702,9 +725,9 @@ def test_create_reference_inclusions_and_exclusions(distance1: int, distance2: i
         Add a branch to the origin repository, if its intended commit exists.
 
         :param name: Name of the branch to add.
-        :param current_commit_count: Number of commits that has so far been added to the main branch.
-        :param branch_distance: Intended distance from the final main branch (which will have 8 commits) for the commit
-                                to branch off (i.e. the branch will start at `main_branch~branch_distance`).
+        :param current_commit_count: Number of commits that has so far been added to the default branch.
+        :param branch_distance: Intended distance from the final default branch (which will have 8 commits) for the
+                                commit to branch off (i.e. the branch will start at `default_branch~branch_distance`).
         :param added: If the branch was previously added.
         :returns: Whether the branch was (previously) added.
         """
@@ -713,7 +736,7 @@ def test_create_reference_inclusions_and_exclusions(distance1: int, distance2: i
         current_distance = branch_distance - (TOTAL_COMMITS_FOR_INCLUSIONS_EXCLUSIONS - current_commit_count)
         if current_distance < 0:
             return False
-        create_branch(origin, name, commit=f"{main_branch()}~{current_distance}")
+        create_branch(origin, name, commit=f"{default_branch()}~{current_distance}")
         return True
 
     bundles = [Path("bundle1.bundle"), Path("bundle2.bundle")]
@@ -759,11 +782,11 @@ def test_create_reference_inclusions_and_exclusions(distance1: int, distance2: i
 @pytest.mark.parametrize(
     "commit",
     [
-        # Lambdas, because main_branch() only becomes available later on
-        main_branch,
-        lambda: f"{main_branch()}~1",
-        lambda: f"{main_branch()}~2",
-        lambda: f"{main_branch()}~3",
+        # Lambdas, because default_branch() only becomes available later on
+        default_branch,
+        lambda: f"{default_branch()}~1",
+        lambda: f"{default_branch()}~2",
+        lambda: f"{default_branch()}~3",
     ],
 )
 def test_create_new_tag_in_incremental_backup(commit: Callable[[], str]) -> None:
@@ -1044,10 +1067,11 @@ def test_create_branch_on_first_commit() -> None:
     backup_bundle_main("restore", target, bundle)
 
     # Full restore succeeded
+    switch_branch(origin, default_branch())
     assert_repos_equal(origin, target)
 
-    # The main branch is at the first-ever commit in the target repository (= parent commit does not exist)
-    assert not try_call_git(["rev-parse", f"{main_branch()}~1"], cwd=target)
+    # The default branch is at the first-ever commit in the target repository (= parent commit does not exist)
+    assert not try_call_git(["rev-parse", f"{default_branch()}~1"], cwd=target)
 
 
 def test_create_only_includes_tags_with_metadata_option() -> None:
@@ -1068,7 +1092,7 @@ def test_create_only_includes_tags_with_metadata_option() -> None:
     copy(previous_bundle, previous_bundle_backup)
 
     add_commits(origin, count=2)
-    tag = create_tag(origin, "le_tag", f"{main_branch()}~1")
+    tag = create_tag(origin, "le_tag", f"{default_branch()}~1")
 
     backup_bundle_main(
         "create", origin, bundles[1], "--previous-bundle-location", previous_bundle, "--metadata", metadata
@@ -1109,14 +1133,14 @@ def test_create_tags_incremental() -> None:
 
     origin = create_repo("origin")
     add_commits(origin, count=3)
-    tag1 = create_tag(origin, "le_tag", f"{main_branch()}~1")
+    tag1 = create_tag(origin, "le_tag", f"{default_branch()}~1")
 
     backup_bundle_main(
         "create", origin, bundles[0], "--previous-bundle-location", previous_bundle, "--metadata", metadata
     )
 
     add_commits(origin, count=2)
-    tag2 = create_tag(origin, "other_tag", f"{main_branch()}~1")
+    tag2 = create_tag(origin, "other_tag", f"{default_branch()}~1")
 
     backup_bundle_main(
         "create", origin, bundles[1], "--previous-bundle-location", previous_bundle, "--metadata", metadata
@@ -1423,7 +1447,7 @@ def test_create_skip_unchanged_removed_branch(commit: str) -> None:
     assert bundle.exists()
 
     backup_bundle_main("restore", target, bundle, "--delete-files", "--force", "--prune")
-    assert_repos_equal(origin, target)
+    assert_repos_equal(origin, target, include_head=False)
 
 
 def test_create_skip_unchanged_new_tag_but_no_tags_included() -> None:
@@ -1445,7 +1469,7 @@ def test_create_skip_unchanged_new_tag_but_no_tags_included() -> None:
 
     backup_bundle_main("restore", target, bundle, "--delete-files")
 
-    create_tag(origin, "a_tag", commit=f"{main_branch()}~1")
+    create_tag(origin, "a_tag", commit=f"{default_branch()}~1")
 
     # No bundle is created if there is a new tag and --skip-unchanged is passed, but tags are not included
     backup_bundle_main("create", origin, bundle, "--previous-bundle", previous_bundle, "--skip-unchanged")
@@ -1508,7 +1532,7 @@ def test_restore_works_on_existing_repo(*, bare: bool) -> None:
     # The incremental update succeeds, without any strategies
     backup_bundle_main("restore", target, bundles[1])
 
-    # HEAD in the target repo is the updated tip of the main branch
+    # HEAD in the target repo is the updated tip of the default branch
     assert get_current_branch(target) == get_current_branch(origin)
 
     # Backups have been restored successfully
@@ -1717,6 +1741,7 @@ def test_restore_outdated_bundle_without_force(*, extra_commits: bool) -> None:
         backup_bundle_main("create", origin, bundle)
         backup_bundle_main("restore", target, bundle)
 
+    switch_branch(origin, default_branch())
     assert_repos_equal(origin, target)
 
     # Attempting to restore the outdated bundle does not fail (but only with --delete-files)
@@ -1822,7 +1847,7 @@ def test_restore_fast_forward_reference() -> None:
     target = create_repo("target", bare=True)
 
     # Create the original branches
-    branch = create_branch(origin, "branched", commit=f"{main_branch()}~2")
+    branch = create_branch(origin, "branched", commit=f"{default_branch()}~2")
     add_commits(origin, branch, count=2)
     branch2 = create_branch(origin, "branch2", commit=f"{branch}~1")
 
@@ -1840,14 +1865,15 @@ def test_restore_fast_forward_reference() -> None:
     backup_bundle_main("restore", target, bundles[1])
 
     # Restoring the backups succeeded
+    switch_branch(origin, default_branch())
     assert_repos_equal(origin, target)
 
 
 @pytest.mark.parametrize(
     "commit",
     [
-        # Lambdas, because main_branch() only becomes available later on
-        lambda: f"{main_branch()}~2",  # Update branch to a previous commit (back in history)
+        # Lambdas, because default_branch() only becomes available later on
+        lambda: f"{default_branch()}~2",  # Update branch to a previous commit (back in history)
         lambda: "sideways_target~1",  # Update branch to a commit on an entirely different branch (rewrite history)
     ],
 )
@@ -1864,8 +1890,8 @@ def test_restore_non_fast_forward_reference_update_requires_force(commit: Callab
 
     origin = create_repo("origin")
     add_commits(origin, count=3)
-    branch = create_branch(origin, "to_be_updated", commit=f"{main_branch()}~1")
-    extra_branch = create_branch(origin, "sideways_target", commit=f"{main_branch()}~2")
+    branch = create_branch(origin, "to_be_updated", commit=f"{default_branch()}~1")
+    extra_branch = create_branch(origin, "sideways_target", commit=f"{default_branch()}~2")
     add_commits(origin, extra_branch, count=2)
 
     target = create_repo("target", bare=True)
@@ -1894,11 +1920,11 @@ def test_restore_non_fast_forward_reference_update_requires_force(commit: Callab
 @pytest.mark.parametrize(
     "commit",
     [
-        # Lambdas, because main_branch() only becomes available later on
-        main_branch,
-        lambda: f"{main_branch()}~1",
-        lambda: f"{main_branch()}~2",
-        lambda: f"{main_branch()}~3",
+        # Lambdas, because default_branch() only becomes available later on
+        default_branch,
+        lambda: f"{default_branch()}~1",
+        lambda: f"{default_branch()}~2",
+        lambda: f"{default_branch()}~3",
     ],
 )
 def test_restore_new_branch_in_incremental_update(commit: Callable[[], str]) -> None:
@@ -1952,7 +1978,7 @@ def test_restore_remove_branch_in_incremental_update_requires_prune(*, prune: bo
     target = create_repo("target")
 
     # Create the branch, with some extra commits
-    branch = create_branch(origin, "branched", commit=f"{main_branch()}~2")
+    branch = create_branch(origin, "branched", commit=f"{default_branch()}~2")
     add_commits(origin, branch)
 
     backup_bundle_main("create", origin, bundles[0], "--previous-bundle-location", previous_bundle)
@@ -2015,7 +2041,7 @@ def test_restore_incremental_without_new_commits(*, force: bool, directory: bool
 
     origin = create_repo("origin")
     add_commits(origin, count=2)
-    branch = create_branch(origin, "branch", commit=f"{main_branch()}~1")
+    branch = create_branch(origin, "branch", commit=f"{default_branch()}~1")
 
     backup_bundle_main("create", origin, bundle)
 
@@ -2026,7 +2052,7 @@ def test_restore_incremental_without_new_commits(*, force: bool, directory: bool
         backup_bundle_main("restore", snapshot, restore_from)
 
     # Update only the branch and create an incremental backup
-    change_branch(origin, branch, new_commit=main_branch())
+    change_branch(origin, branch, new_commit=default_branch())
     backup_bundle_main("create", origin, bundle)
 
     # Attempt to restore the incremental update
@@ -2057,15 +2083,15 @@ def test_restore_update_checked_out_branch_in_clean_worktree_without_force() -> 
 
     backup_bundle_main("create", origin, bundle)
 
-    # Restore the incremental backup after creating a checkout of the main branch (which will be updated)
-    call_git(["checkout", main_branch()], cwd=target)
+    # Restore the incremental backup after creating a checkout of the default branch (which will be updated)
+    call_git(["checkout", default_branch()], cwd=target)
     backup_bundle_main("restore", target, bundle)
 
     # Restore was successful and left no (staged) changes behind
     assert_repos_equal(origin, target)
     assert not call_git(["status", "--porcelain=1"], cwd=target)
     branch_name, _ = get_current_branch(target)
-    assert branch_name == main_branch()
+    assert branch_name == default_branch()
 
 
 def test_restore_refuses_to_overwrite_uncommitted_changes_in_worktree_without_force() -> None:
@@ -2086,7 +2112,7 @@ def test_restore_refuses_to_overwrite_uncommitted_changes_in_worktree_without_fo
     backup_bundle_main("restore", target, bundle)
 
     # Dirty the worktree of the target repo, and check that we did
-    call_git(["checkout", main_branch()], cwd=target)
+    call_git(["checkout", default_branch()], cwd=target)
     assert not call_git(["diff"], cwd=target)
 
     target_file = target / filename
@@ -2129,7 +2155,7 @@ def test_restore_remove_checked_out_branch_in_incremental_update_requires_force(
     target = create_repo("target")
 
     # Create the branch, with some extra commits
-    branch = create_branch(origin, "branched", commit=f"{main_branch()}~2")
+    branch = create_branch(origin, "branched", commit=f"{default_branch()}~2")
     add_commits(origin, branch)
 
     backup_bundle_main("create", origin, bundles[0], "--previous-bundle-location", previous_bundle)
@@ -2166,7 +2192,7 @@ def test_restore_remove_checked_out_branch_in_incremental_update_requires_force(
 
     # Restoring the backups (only) fully succeeded with --prune, did not leave any (staged) changes behind, and left
     # HEAD detached at its previous commit
-    assert_repos_equal(origin, target)
+    assert_repos_equal(origin, target, include_head=False)
     assert not call_git(["status", "--porcelain=1"], cwd=target)
     assert get_current_branch(target) == ("", None)
     assert [checked_out_commit.hash] == call_git(["rev-parse", "HEAD"], cwd=target)
@@ -2294,11 +2320,11 @@ def test_restore_strict_order_applies_force() -> None:
 
     assert_repos_equal(origin, target)
 
-    change_branch(origin, "b", new_commit=main_branch())
+    change_branch(origin, "b", new_commit=default_branch())
 
     backup_bundle_main("create", origin, bundles[0], "--previous-bundle", previous_bundle)
 
-    change_branch(origin, "b2", new_commit=main_branch())
+    change_branch(origin, "b2", new_commit=default_branch())
 
     backup_bundle_main("create", origin, bundles[1], "--previous-bundle", previous_bundle)
 
@@ -2399,7 +2425,7 @@ def test_restore_strict_order_does_not_continue_after_bad_head_update() -> None:
     backup_bundle_main("create", origin, bundles[0], "--previous-bundle", previous_bundle)
 
     # Checkout b and dirty the worktree, so we can't cleanly perform a HEAD update
-    change_branch(origin, "b", new_commit=main_branch())
+    change_branch(origin, "b", new_commit=default_branch())
     add_commits(origin)
 
     backup_bundle_main("create", origin, bundles[1], "--previous-bundle", previous_bundle)
@@ -2409,13 +2435,13 @@ def test_restore_strict_order_does_not_continue_after_bad_head_update() -> None:
         backup_bundle_main("restore", target, bundle_dir, "--strict-order", "--delete-files")
 
     assert all(bundle.exists() for bundle in bundles)
-    assert_repos_equal(intermediate, target)
+    assert_repos_equal(intermediate, target, include_head=False)
 
     # Restoring the directory is possible with --strict-order and --force.
     # This also verifies that --strict-order did not previously imply --force.
     backup_bundle_main("restore", target, bundle_dir, "--strict-order", "--force", "--delete-files")
 
-    assert_repos_equal(origin, target)
+    assert_repos_equal(origin, target, include_head=False)
 
 
 def test_restore_strict_order_without_force_does_not_stop_on_reference_only_bundle() -> None:
@@ -2443,7 +2469,7 @@ def test_restore_strict_order_without_force_does_not_stop_on_reference_only_bund
 
     backup_bundle_main("create", origin, bundles[0], "--previous-bundle", previous_bundle)
 
-    change_branch(origin, "b", new_commit=main_branch())
+    change_branch(origin, "b", new_commit=default_branch())
     add_commits(origin)
 
     backup_bundle_main("create", origin, bundles[1], "--previous-bundle", previous_bundle)
@@ -2455,22 +2481,28 @@ def test_restore_strict_order_without_force_does_not_stop_on_reference_only_bund
 
 
 @pytest.mark.parametrize(
-    ("bare", "empty_repo"),
+    ("bare", "empty_repo", "force"),
     [
-        (True, False),
-        (False, False),
-        (True, True),
-        (False, True),
+        (True, False, True),
+        (False, False, True),
+        (True, True, True),
+        (True, True, False),
+        (False, True, True),
+        (False, True, False),
+        # Restoring into a non-empty repository without --force will break, so no (x, Fakse, False) parametrizations
     ],
 )
-def test_restore_to_repo_with_different_main_branch(*, bare: bool, empty_repo: bool) -> None:
+def test_restore_to_repo_with_different_default_branch(*, bare: bool, empty_repo: bool, force: bool) -> None:
     """
     Verify that restoring into a repository works correctly, even if the restored data does not contain the same default
     (main) branch as the repository being restored to.
 
     :param bare: Whether the new repository is initialized as a bare repository.
     :param empty_repo: whether the new repository will be entirely empty.
+    :param force: Whether `--force --prune` is used when restoring the backup bundle.
     """
+    head_will_be_updated = bare or empty_repo
+
     bundle = Path("bundle.bundle")
     second_bundle = Path("second.bundle")
 
@@ -2487,9 +2519,9 @@ def test_restore_to_repo_with_different_main_branch(*, bare: bool, empty_repo: b
         backup_bundle_main("create", second_origin, second_bundle)
         backup_bundle_main("restore", target, second_bundle, "--force", "--prune")
 
-    backup_bundle_main("restore", target, bundle, "--force", "--prune")
+    backup_bundle_main("restore", target, bundle, *(["--force", "--prune"] if force else []))
 
-    assert_repos_equal(origin, target)
+    assert_repos_equal(origin, target, include_head=head_will_be_updated)
 
 
 @pytest.mark.parametrize("bare", [True, False])
@@ -2524,11 +2556,12 @@ def test_restore_only_new_tags_without_force(*, bare: bool, force: bool, strict_
     backup_bundle_main("create", origin, bundle, "--metadata", metadata, "--previous-bundle-location", previous_bundle)
     assert f"refs/tags/{tag_name}" in list_reference_names_in_repo(bundle)
 
-    # Create a bundle with more information than previous - this will update the main branch. No metadata, so no tags.
+    # Create a bundle with more information than previous - this will update the default branch. No metadata, so no
+    # tags.
     add_commits(origin)
     backup_bundle_main("create", origin, second_bundle, "--previous-bundle-location", previous_bundle)
 
-    # Restore the second bundle first, so we have an advanced main branch, but still miss the 'old' tag
+    # Restore the second bundle first, so we have an advanced default branch, but still miss the 'old' tag
     backup_bundle_main("restore", target, second_bundle)
     assert not any("refs/tags/" in ref for ref in list_reference_names_in_repo(target))
 
@@ -2542,9 +2575,9 @@ def test_restore_only_new_tags_without_force(*, bare: bool, force: bool, strict_
             *(["--strict-order"] if strict_order else []),
         )
 
-    # Verify that the tag has been restored. Only if --force was used, the main branch will have been reset.
+    # Verify that the tag has been restored. Only if --force was used, the default branch will have been reset.
     assert f"refs/tags/{tag_name}" in list_reference_names_in_repo(target)
-    main_ref = find_reference_in_repo(target, f"refs/heads/{main_branch()}")
+    main_ref = find_reference_in_repo(target, f"refs/heads/{default_branch()}")
     tag_ref = find_reference_in_repo(target, f"refs/tags/{tag_name}")
     # Whether the two references point to the same commit depends on whether force was used
     if force:
