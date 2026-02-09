@@ -364,7 +364,8 @@ def list_references_in_repo(repo: Path, *, include_tags: bool = True) -> list[Gi
     if len([ref for ref in references if ref.ref == "HEAD"]) > 1:
         log.error(
             "Ambiguous results for HEAD when obtaining references for repository %s. This should not be possible. "
-            "Continuing without the ambiguous HEAD references."
+            "Continuing without the ambiguous HEAD references.",
+            repo,
         )
         references = [ref for ref in references if ref.ref != "HEAD"]
 
