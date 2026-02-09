@@ -29,7 +29,7 @@ import os
 import random
 import subprocess
 import sys
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager, nullcontext, suppress
 from logging import getLogger
 from pathlib import Path
 from shutil import copy
@@ -50,6 +50,7 @@ this_path = str(Path().absolute())
 sys.path.append(this_path)
 from backup_bundle import (  # noqa: E402
     GitCallFailedError,
+    GitRef,
     MissingRemoteError,
     NoBundlesRestoredError,
     SimpleLockFileNotCreatedError,
@@ -396,6 +397,19 @@ def create_tag(repo: Path, tag: str, commit: str) -> str:
     """
     call_git(["tag", "--no-sign", tag, commit], cwd=repo)
     return tag
+
+
+def find_reference_in_repo(repo: Path, reference: str) -> GitRef:
+    """
+    List the named reference in a (remote) repository.
+
+    The reference must exist.
+
+    :param repo: The repository that the reference is in.
+    :param reference: The full name of the reference.
+    :return: The reference.
+    """
+    return next(ref for ref in list_references_in_repo(repo) if ref.ref == reference)
 
 
 def bundle_verifies(repo: Path, bundle: Path) -> bool:
@@ -2476,3 +2490,64 @@ def test_restore_to_repo_with_different_main_branch(*, bare: bool, empty_repo: b
     backup_bundle_main("restore", target, bundle, "--force", "--prune")
 
     assert_repos_equal(origin, target)
+
+
+@pytest.mark.parametrize("bare", [True, False])
+@pytest.mark.parametrize("force", [True, False])
+@pytest.mark.parametrize("strict_order", [True, False])
+def test_restore_only_new_tags_without_force(*, bare: bool, force: bool, strict_order: bool) -> None:
+    """
+    Verify that restoring a bundle that has no new contents but does have a new tag, restores the new tag.
+
+    :param bare: Whether the target repository is a bare repository.
+    :param force: Whether --force is used.
+    :param strict_order: Whether --strict-order is used, and the path to the directory is passed instead of the bundle
+                         file itself.
+    """
+    bundle_dir = Path("bundles/")
+    bundle = bundle_dir / "bundle.bundle"
+    second_bundle = Path("second.bundle")
+    previous_bundle = Path("previous.bundle")
+    metadata = Path("metadata.json")
+    tag_name = "le_tag"
+
+    origin = create_repo("origin")
+    add_commits(origin, count=3)
+
+    backup_bundle_main("create", origin, bundle, "--previous-bundle-location", previous_bundle)
+
+    target = create_repo("target", bare=bare)
+    backup_bundle_main("restore", target, bundle, "--bare")
+
+    # Create the bundle with only the new tag
+    create_tag(origin, tag_name, "HEAD")
+    backup_bundle_main("create", origin, bundle, "--metadata", metadata, "--previous-bundle-location", previous_bundle)
+    assert f"refs/tags/{tag_name}" in list_reference_names_in_repo(bundle)
+
+    # Create a bundle with more information than previous - this will update the main branch. No metadata, so no tags.
+    add_commits(origin)
+    backup_bundle_main("create", origin, second_bundle, "--previous-bundle-location", previous_bundle)
+
+    # Restore the second bundle first, so we have an advanced main branch, but still miss the 'old' tag
+    backup_bundle_main("restore", target, second_bundle)
+    assert not any("refs/tags/" in ref for ref in list_reference_names_in_repo(target))
+
+    # Perform the restoration of the outdated bundle which does have a new tag
+    with suppress(NoBundlesRestoredError):
+        backup_bundle_main(
+            "restore",
+            target,
+            bundle_dir if strict_order else bundle,
+            *(["--force"] if force else []),
+            *(["--strict-order"] if strict_order else []),
+        )
+
+    # Verify that the tag has been restored. Only if --force was used, the main branch will have been reset.
+    assert f"refs/tags/{tag_name}" in list_reference_names_in_repo(target)
+    main_ref = find_reference_in_repo(target, f"refs/heads/{main_branch()}")
+    tag_ref = find_reference_in_repo(target, f"refs/tags/{tag_name}")
+    # Whether the two references point to the same commit depends on whether force was used
+    if force:
+        assert main_ref.hash == tag_ref.hash
+    else:
+        assert main_ref.hash != tag_ref.hash
