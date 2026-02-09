@@ -1,7 +1,7 @@
 #!/usr/bin/python3
 
 # backup_bundle.py: incremental backup of git repositories based on git bundle
-# Copyright (C) 2025  Thomas Schaap
+# Copyright (C) 2025-2026  Thomas Schaap
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -340,6 +340,38 @@ def exclusion_list(to_exclude: Iterable[str]) -> list[str]:
     return ["--not", *to_exclude] if to_exclude else []
 
 
+def list_references_in_repo(repo: Path, *, include_tags: bool = True) -> list[GitRef]:
+    """
+    List all the references in a (remote) repository.
+
+    :param repo: The repository to list all references for. This may be a bundle file.
+    :param include_tags: Whether to include tags in the list.
+    :return: All the references (HEAD, heads, and tags if requested) in repo.
+    """
+    references = [
+        GitRef.from_show_ref(ref_line) for ref_line in call_git(["ls-remote", str(repo.absolute())], cwd=Path())
+    ]
+    if include_tags:
+        references = [
+            ref
+            for ref in references
+            if ref.ref == "HEAD" or ref.ref.startswith("refs/heads/") or ref.ref.startswith("refs/tags/")
+        ]
+    else:
+        references = [ref for ref in references if ref.ref == "HEAD" or ref.ref.startswith("refs/heads/")]
+
+    # Guard against very unexpected but potentially rather breaking behavior
+    if len([ref for ref in references if ref.ref == "HEAD"]) > 1:
+        log.error(
+            "Ambiguous results for HEAD when obtaining references for repository %s. This should not be possible. "
+            "Continuing without the ambiguous HEAD references.",
+            repo,
+        )
+        references = [ref for ref in references if ref.ref != "HEAD"]
+
+    return references
+
+
 class Backup:
     """
     Context object for creating a backup bundle from a repository.
@@ -454,11 +486,9 @@ class Backup:
         # add all reachable commits since the previous backup, but also that we include *all* references (allowing a
         # `git fetch --all --prune` from the incremental bundle to correctly update the copy). Tags are only included if
         # we can track them, but they're exempt from pruning, anyway.
-        include_tags = ["--tags"] if metadata else []
-        refs_to_include = [
-            GitRef.from_show_ref(ref_line)
-            for ref_line in call_git(["show-ref", "--heads", *include_tags], cwd=self.repo)
-        ]
+        refs_to_include = list_references_in_repo(self.repo, include_tags=metadata is not None)
+        if not any(ref for ref in refs_to_include if ref.ref == "HEAD"):
+            log.warning("No HEAD found in the repository.")
 
         # If tags are to be backed up, we will only include new tags. See `git tag`'s manual page, section
         # "On Retagging": retagging really should never occur and tags can be consider write-once (under normal
@@ -473,10 +503,7 @@ class Backup:
         previous_backup_ref_commits: list[str] = []
         previous_backup_references: list[GitRef] = []
         if stored_bundle.exists():
-            previous_backup_references = [
-                GitRef.from_show_ref(ref_line)
-                for ref_line in call_git(["ls-remote", "--heads", *include_tags, str(stored_bundle)], cwd=Path())
-            ]
+            previous_backup_references = list_references_in_repo(stored_bundle, include_tags=metadata is not None)
             previous_backup_ref_commits = [ref.hash for ref in previous_backup_references]
 
         # Calculate the list of all new commits in this repository, compared to the previous bundle. These commits will
@@ -573,7 +600,7 @@ def get_current_branch(repo: Path) -> tuple[str, GitRef | None]:
     """
     Obtain the name and `GitRef` for the currently checked out branch.
 
-    A new repository will return `("main", None)` (or whichever the main branch name is). A detached head will return
+    A new repository will return `("main", None)` (or whichever the default branch name is). A detached head will return
     `("", None)`.
 
     :param repo: The repository to query.
@@ -594,19 +621,6 @@ def get_current_branch(repo: Path) -> tuple[str, GitRef | None]:
             current_branch = GitRef.from_show_ref(show_ref[0])
 
     return (current_branch_name, current_branch)
-
-
-def list_references_in_repo(repo: Path) -> list[GitRef]:
-    """
-    List all the references in a (remote) repository.
-
-    :param repo: The repository to list all references for. This may be a bundle file.
-    :return: All the references (heads and tags) in repo.
-    """
-    return [
-        GitRef.from_show_ref(ref_line)
-        for ref_line in call_git(["ls-remote", "--heads", "--tags", str(repo.absolute())], cwd=Path())
-    ]
 
 
 def is_bare_repo(repo: Path) -> bool:
@@ -678,6 +692,9 @@ class Restoration:
             self.repo.mkdir(parents=True, exist_ok=True)
             bare_options = ["--bare"] if bare else []
             call_git(["init", *bare_options, "."], cwd=self.repo)
+            # Note that it is not needed to attempt to get the initial branch right, here. An empty repository with an
+            # initial branch that is not listed in the first backup bundle being restored, will have that initial branch
+            # removed anyway.
 
     def _mark_bundle_restored(self, bundle: Path, *, was_already_restored: bool = False) -> bool:
         """
@@ -738,7 +755,7 @@ class Restoration:
         :param new_references: The new references to update the local repository to.
         :return: True iff the update to HEAD is not allowed.
         """
-        if not self.current_branch_name:
+        if not self.current_branch_name or not self.current_branch:
             return False
 
         new_ref_for_current_branch = [
@@ -848,11 +865,17 @@ class Restoration:
                                         updates.
         :return: Whether the bundle was fully restored.
         """
+        force_for_empty_repo = []
+        if len(call_git(["ls-remote", str(self.repo.absolute())], cwd=Path())) == 0:
+            force_for_empty_repo = ["--force", "--prune"]
+            log.info("Detected empty repository. Attempting to restore with --force --prune.")
+
         git_fetch_arguments = [
             "--atomic",
             "--tags",
             "--no-write-fetch-head",
             *self.force_and_prune,
+            *force_for_empty_repo,
             # git would complain about fetching into the current branch, even if that doesn't update anything. Bypass
             # the check with --update-head-ok if we will fix it for git ourselves.
             *(["--update-head-ok"] if force_update_head else []),
@@ -909,6 +932,60 @@ class Restoration:
         log.info("Restored bundle %s", bundle)
 
         return True
+
+    def _try_set_head(self, bundle: Path, new_references: list[GitRef]) -> None:
+        """
+        Restore the HEAD listed in the bundle, if no HEAD is in the repository yet.
+
+        Only an unambiguous (inferred) symbolic reference will be restored, not a detached HEAD.
+
+        :param bundle: The bundle being fetched.
+        :param new_references: The new references that are available in bundle.
+        """
+        have_head = any(ref for ref in list_references_in_repo(self.repo, include_tags=False) if ref.ref == "HEAD")
+
+        # Bail out if there's nothing left to do
+        if have_head:
+            return
+
+        have_new_head = any(ref for ref in new_references if ref.ref == "HEAD")
+
+        # Bail out if the bundle doesn't provide a HEAD to work with
+        if not have_new_head:
+            log.info(
+                "Repository %s does not have a HEAD set, yet, but bundle %s does not provide one either.",
+                self.repo,
+                bundle,
+            )
+            return
+
+        # Correlate the branches and HEAD: we will only set HEAD to a symbolic references.
+        # Note that this step is required because `git bundle` will only store the commit HEAD refers to, not the
+        # original symbolic reference.
+        commit_referenced_by_head = next(ref.hash for ref in new_references if ref.ref == "HEAD")
+        similar_references = [
+            ref.ref for ref in new_references if ref.hash == commit_referenced_by_head and ref.ref != "HEAD"
+        ]
+        if len(similar_references) == 0:
+            log.info(
+                "Repository %s does not have a HEAD set, yet, but bundle %s only provides a detached HEAD.",
+                self.repo,
+                bundle,
+            )
+            return
+        if len(similar_references) > 1:
+            log.info(
+                "Repository %s does not have a HEAD set, yet, but bundle %s does not provide an unambiguous HEAD. It "
+                "could refer to either one of %s",
+                self.repo,
+                bundle,
+                ", ".join(similar_references),
+            )
+            return
+
+        call_git(["symbolic-ref", "HEAD", similar_references[0]], cwd=self.repo)
+
+        log.info("Updated HEAD in repository %s to point to %s", self.repo, similar_references[0])
 
     def _try_restore_tags(self, bundle: Path, new_references: list[GitRef]) -> None:
         """
@@ -1054,6 +1131,9 @@ class Restoration:
                     if strict_order:
                         break
                     continue
+
+                # Finally try and restore a HEAD from the restored bundle, if needed
+                self._try_set_head(current_bundle, references[current_bundle])
 
                 restore_more_bundles |= self._mark_bundle_restored(current_bundle)
 
